@@ -11,6 +11,7 @@ class TestPokerEngine(unittest.TestCase):
     def tearDown(self):
         pe.HUMAN_ID = self.original_human_id
 
+    # --- Side pots ---
     def test_side_pot_logic_basic(self):
         total = [100, 200, 200, 10]
         in_hand = [True, True, True, False]
@@ -22,6 +23,7 @@ class TestPokerEngine(unittest.TestCase):
         self.assertEqual(pots[1]["amount"], 200)
         self.assertEqual(sorted(pots[1]["eligible"]), [1, 2])
 
+    # --- Uncalled refund (ENGINE SIGNATURE: 2 args) ---
     def test_refund_uncalled(self):
         street = [50, 200]
         stacks = [1000, 1000]
@@ -36,6 +38,29 @@ class TestPokerEngine(unittest.TestCase):
         self.assertEqual(street, [50, 50, 50])
         self.assertEqual(stacks, [100, 0, 0])
 
+    def test_refund_uncalled_no_refund_when_tied_max(self):
+        street = [100, 100, 50]
+        stacks = [0, 0, 0]
+        pe.refund_uncalled(street, stacks)
+        self.assertEqual(street, [100, 100, 50])
+        self.assertEqual(stacks, [0, 0, 0])
+
+    # --- Evaluator ---
+    def test_evaluator_wheel_straight(self):
+        # A-2-3-4-5 straight should be 5-high
+        cards = [(14, "s"), (2, "d"), (3, "c"), (4, "h"), (5, "s"), (13, "d"), (12, "c")]
+        rank, kickers = pe.best_hand_7(cards)
+        self.assertEqual(rank, 4)
+        self.assertEqual(kickers, (5,))
+
+    def test_evaluator_wheel_straight_flush(self):
+        # A-2-3-4-5 all same suit => straight flush, 5-high
+        cards = [(14, "s"), (2, "s"), (3, "s"), (4, "s"), (5, "s"), (13, "d"), (12, "c")]
+        rank, kickers = pe.best_hand_7(cards)
+        self.assertEqual(rank, 8)
+        self.assertEqual(kickers, (5,))
+
+    # --- Betting round ---
     def test_betting_round_standard(self):
         t = pe.Table(n=3, stack=1000, seed=0)
         hands = [[(2, "s"), (3, "s")]] * 3
@@ -146,6 +171,30 @@ class TestPokerEngine(unittest.TestCase):
         t.bot.action = should_not_be_called
         t.betting_round(hands, [], in_hand, contrib, pot=0, is_preflop=False)
         self.assertFalse(called["v"])
+
+    # --- Coach helpers ---
+    def test_board_texture_connected(self):
+        board = [(6, "c"), (7, "d"), (8, "h")]
+        tex = pe.board_texture(board)
+        self.assertEqual(tex["summary"], "connected")
+        self.assertEqual(tex["favours"], "caller / wide ranges")
+
+    def test_board_texture_high_card(self):
+        board = [(14, "c"), (13, "d"), (7, "h")]
+        tex = pe.board_texture(board)
+        self.assertEqual(tex["summary"], "high-card")
+        self.assertEqual(tex["favours"], "preflop aggressor")
+
+    def test_mdf_formula(self):
+        t = pe.Table(n=2, stack=1000, seed=0)
+        self.assertAlmostEqual(t.mdf_defend_freq(100, 50), 100 / 150)
+
+    def test_blocker_hints_flush_ace(self):
+        board = [(2, "s"), (9, "s"), (13, "s")]
+        hole = [(14, "s"), (4, "d")]
+        b = pe.blocker_hints(hole, board)
+        self.assertIsNotNone(b["flush_blocker"])
+        self.assertIn("Blocks nut flush", b["note"])
 
 
 if __name__ == "__main__":

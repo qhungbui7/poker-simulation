@@ -1,11 +1,28 @@
 # poker_engine.py
 import itertools
 import random
+import sys
 from collections import Counter
 
 RANKS = list(range(2, 15))
 SUITS = "cdhs"
 HUMAN_ID = 0
+
+MODE = "learn"  # "play" | "learn"
+MC_SAMPLES = 1400
+
+BET_CANDIDATES = (0.5, 0.75, 1.0)
+
+
+def format_card(card):
+    r, s = card
+    m = {11: "J", 12: "Q", 13: "K", 14: "A"}
+    sm = {"c": "♣", "d": "♦", "h": "♥", "s": "♠"}
+    return f"{m.get(r, r)}{sm.get(s, s)}"
+
+
+def format_cards(cards):
+    return " ".join(format_card(c) for c in cards)
 
 
 def make_deck():
@@ -24,12 +41,22 @@ def best_hand_7(cards):
         uniq_desc = sorted(set(ranks), reverse=True)
 
         def straight_high(desc):
-            r = desc[:]
-            if 14 in r:
-                r.append(1)
-            for i in range(len(r) - 4):
-                if r[i] - r[i + 4] == 4:
-                    return r[i]
+            for i in range(len(desc) - 4):
+                if desc[i] - desc[i + 4] == 4:
+                    return desc[i]
+            if desc and desc[0] == 14:
+                has = 0
+                for r in desc:
+                    if r == 5:
+                        has |= 1
+                    elif r == 4:
+                        has |= 2
+                    elif r == 3:
+                        has |= 4
+                    elif r == 2:
+                        has |= 8
+                if has == 15:
+                    return 5
             return None
 
         flush_suit = next((s for s, cnt in sc.items() if cnt >= 5), None)
@@ -104,15 +131,190 @@ def refund_uncalled(street_contrib, stacks):
     mx = max(street_contrib)
     if mx == 0:
         return
-    top = [i for i, c in enumerate(street_contrib) if c == mx]
-    if len(top) != 1:
+    leaders = [i for i, c in enumerate(street_contrib) if c == mx]
+    if len(leaders) != 1:
         return
-    top_i = top[0]
-    second = max((c for i, c in enumerate(street_contrib) if i != top_i), default=0)
+    leader = leaders[0]
+    second = max((c for i, c in enumerate(street_contrib) if i != leader), default=0)
     refund = mx - second
     if refund > 0:
-        street_contrib[top_i] -= refund
-        stacks[top_i] += refund
+        street_contrib[leader] -= refund
+        stacks[leader] += refund
+
+
+def hole_strength_preflop(hole):
+    (r1, s1), (r2, s2) = hole
+    hi, lo = (r1, r2) if r1 >= r2 else (r2, r1)
+    pair = hi == lo
+    suited = s1 == s2
+    gap = hi - lo
+
+    score = 0.0
+    if pair:
+        score += 5.0 + (hi - 2) * 0.55
+    else:
+        score += (hi - 2) * 0.35 + (lo - 2) * 0.15
+        if suited:
+            score += 0.9
+        if gap == 1:
+            score += 0.55
+        elif gap == 2:
+            score += 0.25
+        elif gap >= 5:
+            score -= 0.4
+        if hi >= 13 and lo >= 10:
+            score += 0.4
+
+    return score
+
+
+def all_hole_combos():
+    deck = make_deck()
+    combos = []
+    for i in range(len(deck)):
+        for j in range(i + 1, len(deck)):
+            h = (deck[i], deck[j])
+            combos.append((hole_strength_preflop(h), h))
+    combos.sort(key=lambda x: x[0])
+    return combos
+
+
+ALL_COMBOS = all_hole_combos()
+ALL_SCORES = [s for s, _ in ALL_COMBOS]
+
+
+def range_threshold(percent):
+    if percent <= 0:
+        return 10**9
+    if percent >= 1:
+        return -10**9
+    cut = int((1.0 - percent) * len(ALL_SCORES))
+    if cut < 0:
+        cut = 0
+    if cut >= len(ALL_SCORES):
+        cut = len(ALL_SCORES) - 1
+    return ALL_SCORES[cut]
+
+
+def board_texture(board):
+    if not board:
+        return {
+            "paired": False,
+            "two_tone": False,
+            "monotone": False,
+            "connected": 0,
+            "high": None,
+            "summary": "preflop",
+            "favours": "unknown",
+        }
+
+    ranks = sorted({r for r, _ in board})
+    suits = [s for _, s in board]
+    sc = Counter(suits)
+
+    paired = len(ranks) < len(board)
+    monotone = max(sc.values()) >= 3
+    two_tone = (not monotone) and max(sc.values()) == 2
+
+    ranks_desc = sorted(ranks, reverse=True)
+    connected = 0
+    for i in range(len(ranks_desc) - 1):
+        d = ranks_desc[i] - ranks_desc[i + 1]
+        if d == 1:
+            connected += 2
+        elif d == 2:
+            connected += 1
+
+    hi = max(ranks) if ranks else None
+
+    if paired:
+        summary = "paired"
+    elif monotone:
+        summary = "monotone"
+    elif two_tone:
+        summary = "two-tone"
+    elif connected >= 3:
+        summary = "connected"
+    elif hi is not None and hi >= 13:
+        summary = "high-card"
+    else:
+        summary = "dry"
+
+    favours = "unknown"
+    if summary in ("high-card", "dry"):
+        favours = "preflop aggressor"
+    if summary in ("connected",):
+        favours = "caller / wide ranges"
+    if summary in ("monotone", "two-tone"):
+        favours = "range-dependent"
+    if summary in ("paired",):
+        favours = "preflop aggressor (slightly)"
+
+    return {
+        "paired": paired,
+        "two_tone": two_tone,
+        "monotone": monotone,
+        "connected": connected,
+        "high": hi,
+        "summary": summary,
+        "favours": favours,
+    }
+
+
+def flush_draw_info(hole, board):
+    suits = [s for _, s in board] + [s for _, s in hole]
+    sc = Counter(suits)
+    best_suit, cnt = sc.most_common(1)[0]
+    return best_suit, cnt
+
+
+def straight_draw_flags(hole, board):
+    ranks = sorted(set([r for r, _ in board] + [r for r, _ in hole]))
+    if not ranks:
+        return False, False
+
+    def has_run_of_len(L):
+        for i in range(len(ranks) - (L - 1)):
+            if ranks[i + (L - 1)] - ranks[i] == (L - 1):
+                return True
+        return False
+
+    open_ended = has_run_of_len(4)
+    gutshot = False
+
+    rs = set(ranks)
+    for start in range(2, 11):
+        window = {start, start + 1, start + 2, start + 3, start + 4}
+        inter = len(window & rs)
+        if inter == 4:
+            gutshot = True
+            break
+
+    if 14 in rs:
+        wheel_window = {14, 2, 3, 4, 5}
+        if len(wheel_window & rs) == 4:
+            gutshot = True
+
+    return open_ended, gutshot
+
+
+def blocker_hints(hole, board):
+    if len(board) < 3:
+        return {"flush_blocker": None, "note": ""}
+
+    sc = Counter([s for _, s in board])
+    suit, cnt = sc.most_common(1)[0]
+    if cnt < 3:
+        return {"flush_blocker": None, "note": ""}
+
+    suited_ranks = {r for r, s in hole if s == suit}
+    if 14 in suited_ranks:
+        return {"flush_blocker": f"A{format_card((14, suit))[1]}", "note": "Blocks nut flush for this suit."}
+    if 13 in suited_ranks:
+        return {"flush_blocker": f"K{format_card((13, suit))[1]}", "note": "Blocks 2nd-nut flush for this suit."}
+    if 12 in suited_ranks:
+        return {"flush_blocker": f"Q{format_card((12, suit))[1]}", "note": "Blocks strong flushes for this suit."}
+    return {"flush_blocker": None, "note": ""}
 
 
 class AdaptiveBot:
@@ -125,15 +327,29 @@ class AdaptiveBot:
 
 
 class Table:
-    def __init__(self, n=6, stack=1000, sb=5, bb=10, seed=0, bot=None):
+    def __init__(self, n=6, stack=1000, sb=5, bb=10, seed=0, bot=None, mode=MODE, mc_samples=MC_SAMPLES):
         self.n = n
         self.stacks = [stack] * n
         self.sb = sb
         self.bb = bb
         self.btn = 0
+
+        self.base_seed = seed
         self.rng = random.Random(seed)
+        self.eval_rng = random.Random(seed + 99991)
+        self.hand_no = 0
+
         self.bot = bot or AdaptiveBot()
+
         self.total_chips = sum(self.stacks)
+        self.mode = mode
+        self.mc_samples = mc_samples
+
+        self.hand_log = []
+        self.showdown_log = {}
+
+        self.range_pct = [0.55] * n
+        self.preflop_aggressor = None
 
     def check_invariants(self):
         assert all(s >= 0 for s in self.stacks)
@@ -156,6 +372,18 @@ class Table:
     def can_act_count(self, in_hand):
         return sum(1 for i, a in enumerate(in_hand) if a and self.stacks[i] > 0)
 
+    def pot_total(self, pot, street_contrib):
+        return pot + sum(street_contrib)
+
+    def street_name(self, board, is_preflop):
+        if is_preflop:
+            return "preflop"
+        if len(board) == 3:
+            return "flop"
+        if len(board) == 4:
+            return "turn"
+        return "river"
+
     def valid_actions(self, to_call, stack, can_raise):
         if to_call == 0:
             acts = ["check"]
@@ -167,8 +395,346 @@ class Table:
             acts.append("raise")
         return acts
 
-    def betting_round(self, hands, board, in_hand, street_contrib, pot, is_preflop):
+    def update_range_from_action(self, seat, street, action, to_call, raise_by):
+        p = self.range_pct[seat]
+
+        if street == "preflop":
+            if action == "raise":
+                p = min(p, 0.22)
+                if self.preflop_aggressor is None:
+                    self.preflop_aggressor = seat
+            elif action == "call":
+                p = min(p, 0.38 if to_call > 0 else 0.55)
+            elif action == "check":
+                p = min(p, 0.60)
+        else:
+            if action == "raise":
+                p = min(p, 0.14 if raise_by >= max(1, to_call) else 0.20)
+            elif action == "call":
+                p = min(p, 0.26 if to_call > 0 else 0.40)
+            elif action == "check":
+                p = min(p, 0.55)
+
+        self.range_pct[seat] = p
+
+    def sample_hole_from_range(self, threshold, banned, rng):
+        while True:
+            idx = rng.randrange(len(ALL_COMBOS))
+            score, hole = ALL_COMBOS[idx]
+            if score < threshold:
+                continue
+            c1, c2 = hole
+            if c1 in banned or c2 in banned:
+                continue
+            return hole
+
+    def estimate_equity_vs_ranges(self, hero_hole, board, opp_seats, samples, rng):
+        if not opp_seats:
+            return 1.0
+
+        used = set(hero_hole)
+        used.update(board)
+
+        need_board = 5 - len(board)
+        wins = 0
+        ties = 0
+
+        thresholds = [range_threshold(self.range_pct[s]) for s in opp_seats]
+        deck_all = make_deck()
+        deck_rem = [c for c in deck_all if c not in used]
+
+        for _ in range(samples):
+            banned = set(used)
+            opp_holes = []
+            for t in thresholds:
+                hole = self.sample_hole_from_range(t, banned, rng)
+                opp_holes.append(hole)
+                banned.add(hole[0])
+                banned.add(hole[1])
+
+            runout = rng.sample([c for c in deck_rem if c not in banned], need_board)
+            full_board = board + runout
+
+            hero_score = best_hand_7(list(hero_hole) + full_board)
+            opp_best = max(best_hand_7(list(h) + full_board) for h in opp_holes)
+
+            if hero_score > opp_best:
+                wins += 1
+            elif hero_score == opp_best:
+                ties += 1
+
+        return (wins + 0.5 * ties) / samples
+
+    def continue_probability(self, seat, street, pot_now, bet_size, to_call):
+        p = self.range_pct[seat]
+        tightness = 1.0 - p
+
+        pot_now = max(1, pot_now)
+        size_ratio = bet_size / pot_now
+
+        base = {"preflop": 0.45, "flop": 0.40, "turn": 0.35, "river": 0.28}[street]
+        cont = base + 0.55 * tightness - 0.35 * size_ratio
+
+        if to_call > 0:
+            price_ratio = to_call / (pot_now + to_call)
+            cont -= 0.25 * price_ratio
+
+        if cont < 0.02:
+            cont = 0.02
+        if cont > 0.98:
+            cont = 0.98
+        return cont
+
+    def effective_stack(self, idx, in_hand):
+        opp = [self.stacks[i] for i, a in enumerate(in_hand) if a and i != idx]
+        if not opp:
+            return self.stacks[idx]
+        return min(self.stacks[idx], max(opp))
+
+    def mdf_defend_freq(self, pot_now, bet):
+        if bet <= 0:
+            return 1.0
+        return pot_now / (pot_now + bet)
+
+    def hero_strength_percentile(self, hero_hole, board, opp_seats, rng):
+        used = set(hero_hole)
+        used.update(board)
+        deck = [c for c in make_deck() if c not in used]
+
+        sample_holes = []
+        n = 40
+        for _ in range(n):
+            c1, c2 = rng.sample(deck, 2)
+            sample_holes.append((c1, c2))
+
+        hero_eq = self.estimate_equity_vs_ranges(hero_hole, board, opp_seats, samples=260, rng=rng)
+        eqs = []
+        for h in sample_holes:
+            eqs.append(self.estimate_equity_vs_ranges(h, board, opp_seats, samples=160, rng=rng))
+
+        weaker = sum(1 for e in eqs if e <= hero_eq)
+        return hero_eq, weaker / len(eqs)
+
+    def action_ev(self, hero_hole, board, in_hand, street_contrib, pot, idx, choice, raise_by, rng):
+        pot_now = self.pot_total(pot, street_contrib)
         current_bet = max(street_contrib)
+        to_call = current_bet - street_contrib[idx]
+        street = self.street_name(board, is_preflop=(len(board) == 0))
+
+        opp_seats = [i for i, a in enumerate(in_hand) if a and i != idx]
+        eq_all = self.estimate_equity_vs_ranges(hero_hole, board, opp_seats, samples=self.mc_samples, rng=rng)
+
+        if choice == "fold":
+            return 0.0, {"eq": eq_all}
+
+        if choice == "check":
+            return 0.0, {"eq": eq_all}
+
+        if choice == "call":
+            ev = eq_all * (pot_now + to_call) - to_call
+            req = to_call / (pot_now + to_call)
+            return ev, {"eq": eq_all, "req": req}
+
+        if choice == "raise":
+            invest = to_call + raise_by
+            bet_size = raise_by if to_call == 0 else invest
+
+            cont_probs = [self.continue_probability(s, street, pot_now, bet_size, to_call) for s in opp_seats]
+            fold_all = 1.0
+            for cp in cont_probs:
+                fold_all *= (1.0 - cp)
+
+            exp_callers = sum(cont_probs)
+            if exp_callers < 0.01:
+                exp_callers = 0.01
+
+            old = [self.range_pct[s] for s in opp_seats]
+            for s in opp_seats:
+                self.range_pct[s] = min(self.range_pct[s], 0.28)
+            eq_called = self.estimate_equity_vs_ranges(hero_hole, board, opp_seats, samples=max(500, self.mc_samples // 2), rng=rng)
+            for s, v in zip(opp_seats, old):
+                self.range_pct[s] = v
+
+            pot_if_called = pot_now + invest + invest * exp_callers
+            ev_foldwin = fold_all * pot_now
+            ev_called = (1.0 - fold_all) * (eq_called * pot_if_called - invest)
+            return ev_foldwin + ev_called, {
+                "eq_all": eq_all,
+                "eq_called": eq_called,
+                "fold_all": fold_all,
+                "exp_callers": exp_callers,
+                "invest": invest,
+                "pot_now": pot_now,
+            }
+
+        return 0.0, {}
+
+    def advise_action(self, hero_hole, board, in_hand, street_contrib, pot, idx, valid):
+        pot_now = self.pot_total(pot, street_contrib)
+        current_bet = max(street_contrib)
+        to_call = current_bet - street_contrib[idx]
+        street = self.street_name(board, is_preflop=(len(board) == 0))
+        opp_seats = [i for i, a in enumerate(in_hand) if a and i != idx]
+
+        rng = random.Random(self.base_seed + 1000003 * self.hand_no + 97 * idx + 13 * len(board))
+        tex = board_texture(board)
+        blockers = blocker_hints(hero_hole, board)
+        eff = self.effective_stack(idx, in_hand)
+        spr = eff / max(1, pot_now)
+
+        hero_eq, hero_pct = self.hero_strength_percentile(hero_hole, board, opp_seats, rng)
+
+        defend_freq = 1.0
+        mdf_threshold = 0.0
+        if to_call > 0:
+            defend_freq = self.mdf_defend_freq(pot_now, to_call)
+            mdf_threshold = 1.0 - defend_freq
+
+        candidates = []
+        ev_map = {}
+
+        for act in ("fold", "check", "call"):
+            if act in valid:
+                ev, dbg = self.action_ev(hero_hole, board, in_hand, street_contrib, pot, idx, act, 0, rng)
+                candidates.append((act, 0, ev, dbg))
+                ev_map[(act, 0)] = ev
+
+        if "raise" in valid:
+            if to_call == 0:
+                for frac in BET_CANDIDATES:
+                    rb = max(self.bb, int(frac * max(1, pot_now)))
+                    ev, dbg = self.action_ev(hero_hole, board, in_hand, street_contrib, pot, idx, "raise", rb, rng)
+                    candidates.append(("raise", rb, ev, dbg))
+                    ev_map[("raise", rb)] = ev
+            else:
+                min_inc = self.bb
+                for frac in (0.5, 0.75, 1.0):
+                    rb = max(min_inc, int(frac * (pot_now + to_call)))
+                    ev, dbg = self.action_ev(hero_hole, board, in_hand, street_contrib, pot, idx, "raise", rb, rng)
+                    candidates.append(("raise", rb, ev, dbg))
+                    ev_map[("raise", rb)] = ev
+
+        best = max(candidates, key=lambda x: x[2])
+        best_action = (best[0], best[1])
+        best_ev = best[2]
+
+        # MDF layer: if facing a bet, EV says fold, but your hand is above MDF cutoff, suggest call.
+        if to_call > 0 and ("call" in valid) and best_action == ("fold", 0):
+            call_ev = ev_map.get(("call", 0), -10**9)
+            if hero_pct >= mdf_threshold and call_ev > -0.03 * pot_now:
+                best_action = ("call", 0)
+                best_ev = call_ev
+
+        draw_suit, suit_cnt = flush_draw_info(hero_hole, board)
+        open_ended, gutshot = straight_draw_flags(hero_hole, board)
+
+        implied = ""
+        if len(board) >= 3:
+            if suit_cnt == 4 or open_ended or gutshot:
+                if spr >= 6:
+                    implied = "Implied odds: deep SPR boosts draws."
+                else:
+                    implied = "Draw: implied odds limited at low SPR."
+            else:
+                if spr >= 8:
+                    implied = "Reverse implied odds risk: deep SPR punishes thin one-pair hands."
+
+        range_note = "unknown"
+        if self.preflop_aggressor is not None and len(board) >= 3:
+            if tex["favours"] == "preflop aggressor":
+                range_note = f"Board favors aggressor (seat {self.preflop_aggressor})."
+            elif tex["favours"] == "caller / wide ranges":
+                range_note = "Board favors wider ranges (callers/connectors)."
+            else:
+                range_note = "Board is range-dependent."
+
+        return {
+            "street": street,
+            "pot_now": pot_now,
+            "to_call": to_call,
+            "hero_eq": hero_eq,
+            "hero_pct": hero_pct,
+            "defend_freq": defend_freq,
+            "mdf_threshold": mdf_threshold,
+            "best_action": best_action,
+            "best_ev": best_ev,
+            "candidates": candidates,
+            "texture": tex,
+            "range_note": range_note,
+            "blockers": blockers,
+            "spr": spr,
+            "implied": implied,
+        }
+
+    def print_state(self, hands, board, in_hand, street_contrib, pot, idx):
+        current_bet = max(street_contrib)
+        to_call = current_bet - street_contrib[idx]
+        pot_now = self.pot_total(pot, street_contrib)
+
+        print("\n" + "=" * 78)
+        print(f"Seat {idx} (YOU) to act")
+        print(f"Board: {format_cards(board) if board else '(preflop)'}")
+        print(f"Your hand: {format_cards(hands[idx])}")
+        print(f"Pot: {pot_now} | To call: {to_call} | Stack: {self.stacks[idx]}")
+        print("Stacks:", self.stacks)
+        print("In hand:", in_hand)
+        print("Street contrib:", street_contrib)
+
+    def print_advice(self, advice):
+        street = advice["street"]
+        pot_now = advice["pot_now"]
+        to_call = advice["to_call"]
+        a, amt = advice["best_action"]
+
+        tex = advice["texture"]
+        blockers = advice["blockers"]
+
+        print("-" * 78)
+        print("Learning mode coach (ranges + fold equity + MDF + texture + blockers + SPR)")
+        print("Opponent model is heuristic, not solver-GTO. Still useful.")
+        print(f"Street: {street} | Pot: {pot_now} | To call: {to_call} | SPR: {advice['spr']:.2f}")
+        print(f"Board texture: {tex['summary']} | Favours: {tex['favours']} | {advice['range_note']}")
+
+        if blockers["flush_blocker"] is not None:
+            print(f"Blocker: {blockers['flush_blocker']} | {blockers['note']}")
+
+        if advice["implied"]:
+            print(f"{advice['implied']}")
+
+        print(f"Hero showdown equity vs ranges: {advice['hero_eq']:.3f}")
+        print(f"Hero strength percentile (vs random hero samples): {advice['hero_pct']:.2f}")
+
+        if to_call > 0:
+            defend = advice["defend_freq"]
+            foldfreq = 1.0 - defend
+            print(f"MDF defend freq ≈ {defend:.2f} (fold ≈ {foldfreq:.2f}) | MDF cutoff percentile ≈ {advice['mdf_threshold']:.2f}")
+
+        rec = a if a != "raise" else f"raise by {amt}"
+        print(f"Recommended: {rec} | EV ≈ {advice['best_ev']:.2f}")
+
+        print("Top candidates:")
+        bests = sorted(advice["candidates"], key=lambda x: x[2], reverse=True)[:5]
+        for act, am, ev, _dbg in bests:
+            label = act if act != "raise" else f"raise {am}"
+            print(f"  {label:<12} EV ≈ {ev:.2f}")
+        print("-" * 78)
+
+    def log_event(self, street, idx, action, amt, board, pot_before, to_call, advice):
+        self.hand_log.append({
+            "street": street,
+            "seat": idx,
+            "action": action,
+            "amt": amt,
+            "board": board[:],
+            "pot_before": pot_before,
+            "to_call": to_call,
+            "advice": advice
+        })
+
+    def betting_round(self, hands, board, in_hand, street_contrib, pot, is_preflop):
+        street = self.street_name(board, is_preflop)
+        current_bet = max(street_contrib)
+
         last_full_raise = self.bb
         acted = [False] * self.n
         raise_allowed = [True] * self.n
@@ -199,19 +765,29 @@ class Table:
             to_call = current_bet - street_contrib[idx]
             valid = self.valid_actions(to_call, self.stacks[idx], raise_allowed[idx])
 
+            advice = None
             if idx == HUMAN_ID:
-                choice = input(f"Action {valid}: ").strip().lower()
-                if choice == "r":
-                    choice = "raise"
-                if choice == "c":
-                    choice = "call"
-                if choice == "f":
-                    choice = "fold"
-                if choice == "k":
-                    choice = "check"
+                self.print_state(hands, board, in_hand, street_contrib, pot, idx)
+                if self.mode == "learn":
+                    advice = self.advise_action(hands[idx], board, in_hand, street_contrib, pot, idx, valid)
+                    self.print_advice(advice)
+
+                mapping = {"r": "raise", "c": "call", "f": "fold", "k": "check"}
+                while True:
+                    raw = input(f"Action {valid} (r/c/f/k): ").strip().lower()
+                    choice = mapping.get(raw, raw)
+                    if choice in valid:
+                        break
+                    print(f"Invalid action '{raw}'. Valid options: {valid}")
+
                 amt = 0
                 if choice == "raise":
-                    amt = int(input("Raise by: "))
+                    while True:
+                        s = input("Raise by (chips on top of call): ").strip()
+                        if s.isdigit() and int(s) > 0:
+                            amt = int(s)
+                            break
+                        print("Enter a positive integer.")
             else:
                 choice, amt = self.bot.action(
                     hands[idx],
@@ -222,7 +798,9 @@ class Table:
                     valid,
                 )
 
-            valid.index(choice)
+            pot_before = self.pot_total(pot, street_contrib)
+            self.log_event(street, idx, choice, amt, board, pot_before, to_call, advice if idx == HUMAN_ID else None)
+            self.update_range_from_action(idx, street, choice, to_call, amt)
 
             if choice == "fold":
                 in_hand[idx] = False
@@ -244,6 +822,7 @@ class Table:
 
                 pay_target = to_call + amt
                 pay = min(self.stacks[idx], pay_target)
+
                 self.stacks[idx] -= pay
                 prev_bet = current_bet
                 street_contrib[idx] += pay
@@ -280,9 +859,11 @@ class Table:
     def award_fold_win(self, in_hand, pot):
         winner = next(i for i, a in enumerate(in_hand) if a)
         self.stacks[winner] += pot
+        return winner
 
     def distribute_showdown(self, hands, board, total_contrib, in_hand):
         pots = build_side_pots(total_contrib, in_hand)
+        awards = []
         for pot_obj in pots:
             amt = pot_obj["amount"]
             elig = pot_obj["eligible"]
@@ -311,7 +892,52 @@ class Table:
                         self.stacks[seat] += rem
                         break
 
+            awards.append({"amount": amt, "eligible": elig, "winners": winners, "hand_class": best[0]})
+        return awards
+
+    def print_post_hand_evaluation(self):
+        print("\n" + "=" * 78)
+        print("Post-hand evaluation")
+        print(f"Final board: {format_cards(self.showdown_log.get('board', []))}")
+        hands = self.showdown_log.get("hands", [])
+        if hands:
+            for i, h in enumerate(hands):
+                print(f"Seat {i} hole: {format_cards(h)}")
+        print("Final stacks:", self.stacks)
+
+        awards = self.showdown_log.get("awards", None)
+        fold_winner = self.showdown_log.get("fold_winner", None)
+        if fold_winner is not None:
+            print(f"Hand ended by folds. Winner: Seat {fold_winner}")
+        elif awards is not None:
+            for j, a in enumerate(awards, 1):
+                print(f"Pot {j}: {a['amount']} | Eligible {a['eligible']} | Winners {a['winners']} | Class {a['hand_class']}")
+
+        print("\nDecision trace (your actions annotated when available)")
+        for e in self.hand_log:
+            actor = "YOU" if e["seat"] == HUMAN_ID else f"Seat {e['seat']}"
+            b = format_cards(e["board"]) if e["board"] else "(preflop)"
+            line = f"[{e['street']}] {actor}: {e['action']}"
+            if e["action"] == "raise":
+                line += f" by {e['amt']}"
+            line += f" | board {b} | pot_before {e['pot_before']} | to_call {e['to_call']}"
+            print(line)
+
+            if e["seat"] == HUMAN_ID and e["advice"] is not None:
+                a = e["advice"]
+                rec_a, rec_amt = a["best_action"]
+                rec = rec_a if rec_a != "raise" else f"raise {rec_amt}"
+                print(f"  advice: {rec} | EV ≈ {a['best_ev']:.2f}")
+
     def next_hand(self):
+        self.hand_log = []
+        self.showdown_log = {}
+        self.range_pct = [0.55] * self.n
+        self.preflop_aggressor = None
+
+        self.hand_no += 1
+        self.eval_rng = random.Random(self.base_seed + 1000003 * self.hand_no)
+
         deck = make_deck()
         self.rng.shuffle(deck)
 
@@ -342,7 +968,10 @@ class Table:
         street_contrib = [0] * self.n
 
         if self.in_hand_count(in_hand) <= 1:
-            self.award_fold_win(in_hand, pot)
+            winner = self.award_fold_win(in_hand, pot)
+            self.showdown_log = {"board": board[:], "hands": hands, "fold_winner": winner}
+            if self.mode in ("play", "learn"):
+                self.print_post_hand_evaluation()
             self.btn = (self.btn + 1) % self.n
             return
 
@@ -365,17 +994,48 @@ class Table:
             street_contrib = [0] * self.n
 
             if self.in_hand_count(in_hand) <= 1:
-                self.award_fold_win(in_hand, pot)
+                winner = self.award_fold_win(in_hand, pot)
+                self.showdown_log = {"board": board[:], "hands": hands, "fold_winner": winner}
+                if self.mode in ("play", "learn"):
+                    self.print_post_hand_evaluation()
                 self.btn = (self.btn + 1) % self.n
                 return
 
         if len(board) < 5:
             self.runout_to_river(deck, board)
 
-        self.distribute_showdown(hands, board, total_contrib, in_hand)
+        awards = self.distribute_showdown(hands, board, total_contrib, in_hand)
+        self.showdown_log = {"board": board[:], "hands": hands, "awards": awards}
+
+        if self.mode in ("play", "learn"):
+            self.print_post_hand_evaluation()
+
         self.btn = (self.btn + 1) % self.n
 
     def simulate(self, hands=1000):
         for _ in range(hands):
             self.next_hand()
             self.check_invariants()
+
+
+def main():
+    mode = MODE
+    if len(sys.argv) >= 2:
+        mode = sys.argv[1].strip().lower()
+    if mode not in ("play", "learn"):
+        mode = "play"
+
+    t = Table(n=6, stack=1000, sb=5, bb=10, seed=0, mode=mode, mc_samples=MC_SAMPLES)
+    print(f"Mode: {mode}")
+    print("Controls: r=raise, c=call, f=fold, k=check")
+    print("Learn mode adds: ranges, fold equity, MDF, texture, blockers, SPR warnings.")
+
+    while True:
+        t.next_hand()
+        cont = input("\nNext hand? (y/n): ").strip().lower()
+        if cont != "y":
+            break
+
+
+if __name__ == "__main__":
+    main()
