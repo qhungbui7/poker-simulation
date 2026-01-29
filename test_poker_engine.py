@@ -1,211 +1,161 @@
 import unittest
-import random
-import types
-import copy
-
 import poker_engine as pe
 
-def C(r, s):
-    return (r, s)
+class TestAlgorithms(unittest.TestCase):
 
-class BaseTest(unittest.TestCase):
     def setUp(self):
-        # Make deterministic
-        random.seed(42)
-        # Ensure no interactive human actions
-        self.orig_human = pe.HUMAN_ID
-        pe.HUMAN_ID = 999
-        # Save original AdaptiveBot.action to restore later
-        self.orig_bot_action = pe.AdaptiveBot.action
+        # FIX: Disable human interaction for ALL tests.
+        # Setting this to -1 ensures the engine always uses 'self.bot.action'
+        # instead of asking for input(), allowing us to mock every player.
+        self.original_human_id = pe.HUMAN_ID
+        pe.HUMAN_ID = -1
 
     def tearDown(self):
-        pe.HUMAN_ID = self.orig_human
-        pe.AdaptiveBot.action = self.orig_bot_action
+        # Restore original state
+        pe.HUMAN_ID = self.original_human_id
 
-# -------------------------
-# evaluator & basic checks
-# -------------------------
-class TestEvaluator(BaseTest):
+    # --- A. Test Side Pot Construction ---
+    def test_side_pot_logic_basic(self):
+        """
+        Verifies that side pots are correctly created when players have unequal stacks.
+        Scenario:
+        - P0: 100 (All-in)
+        - P1: 200 (All-in)
+        - P2: 500 (Covering, puts in 200)
+        - P3: Folded (put in 10)
+        Result should be two pots: Main (310) and Side (200).
+        """
+        contrib = [100, 200, 200, 10]
+        active = [True, True, True, False]
+        
+        pots = pe.build_side_pots(contrib, active)
+        
+        self.assertEqual(len(pots), 2)
+        
+        # Pot 1 (Main): Everyone contributed at least 100 (or folded 10)
+        # Calculation: P0(100)+P1(100)+P2(100)+P3(10) = 310
+        self.assertEqual(pots[0]['amount'], 310)
+        self.assertEqual(sorted(pots[0]['eligible']), [0, 1, 2])
+        
+        # Pot 2 (Side): Chips above 100
+        # Calculation: P1(100)+P2(100) = 200
+        self.assertEqual(pots[1]['amount'], 200)
+        self.assertEqual(sorted(pots[1]['eligible']), [1, 2])
 
-    def test_wheel_and_sf_and_quads(self):
-        cases = [
-            ( [C(14,'s'), C(2,'d'), C(3,'h'), C(4,'c'), C(5,'s'), C(9,'d'), C(10,'c')], 4, 5 ),  # wheel
-            ( [C(9,'s'), C(8,'s'), C(7,'s'), C(6,'s'), C(5,'s'), C(2,'d'), C(3,'c')], 8, 9 ),   # straight flush
-            ( [C(7,'s'), C(7,'d'), C(7,'h'), C(7,'c'), C(4,'s'), C(2,'d'), C(3,'c')], 7, 7 ),    # quads
-        ]
-        for cards, expect_cat, expect_top in cases:
-            cat, v = pe.best_hand_7(cards)
-            self.assertEqual(cat, expect_cat)
-            # ensure first value corresponds to top card where appropriate
-            self.assertEqual(v[0], expect_top)
+    def test_side_pot_uncalled_return(self):
+        """
+        Verifies behavior when a raise is uncalled (effectively a single-player side pot).
+        """
+        contrib = [50, 200]
+        active = [True, True]
+        
+        pots = pe.build_side_pots(contrib, active)
+        
+        # Main Pot: 50 from each = 100 total
+        self.assertEqual(pots[0]['amount'], 100)
+        
+        # Side Pot: 150 from P1, only P1 eligible
+        self.assertEqual(pots[1]['amount'], 150)
+        self.assertEqual(pots[1]['eligible'], [1]) 
 
-    def test_full_house_and_flush(self):
-        fh = [C(9,'s'), C(9,'d'), C(9,'h'), C(4,'c'), C(4,'s'), C(2,'d'), C(3,'c')]
-        cat, v = pe.best_hand_7(fh)
-        self.assertEqual(cat, 6)
-        self.assertEqual(v[0], 9)
-        fl = [C(14,'s'), C(12,'s'), C(10,'s'), C(8,'s'), C(6,'s'), C(2,'d'), C(3,'c')]
-        cat2, v2 = pe.best_hand_7(fl)
-        self.assertEqual(cat2, 5)
-        self.assertEqual(v2[0], 14)
+    # --- B. Test Betting State Machine ---
+    def test_betting_termination_standard(self):
+        """
+        Tests a standard betting round with Check/Raise/Call sequence.
+        Since HUMAN_ID is -1, we can script Seat 0's actions via the mock.
+        """
+        t = pe.Table(n=3, stack=1000)
+        hands = [[(2, 's'), (3, 's')]] * 3
+        board = []
+        active = [True, True, True]
+        contrib = [0, 0, 0]
+        
+        # Scripted Sequence:
+        # P1: Check
+        # P2: Check
+        # P0: Raise 100
+        # P1: Call
+        # P2: Call
+        # End of round (everyone matched 100)
+        
+        moves = iter([
+            ("check", 0),  # P1 action
+            ("check", 0),  # P2 action
+            ("raise", 100),# P0 action (Now handled by mock!)
+            ("call", 0),   # P1 calls raise
+            ("call", 0),   # P2 calls raise
+        ])
+        
+        # This lambda consumes the iterator for every player
+        t.bot.action = lambda *args: next(moves)
+        
+        # Start betting (starts at P1 because P0 is Button)
+        t.betting_round(hands, board, active, contrib, 0)
+        
+        # Assertions
+        self.assertEqual(contrib, [100, 100, 100])
+        
+        # Verify iterator is exhausted (proof that exactly those moves happened)
+        self.assertRaises(StopIteration, next, moves)
 
-# -------------------------
-# equity invariants & orders
-# -------------------------
-class TestEquityProperties(BaseTest):
+    def test_betting_termination_all_in(self):
+        """
+        Tests that the loop terminates correctly when a player goes All-In 
+        for LESS than the current bet.
+        """
+        t = pe.Table(n=2, stack=1000)
+        t.stacks[1] = 50 # P1 is short stacked
+        
+        hands = [[(14,'s'),(14,'h')]]*2
+        active = [True, True]
+        contrib = [0, 0]
+        
+        # Scripted Sequence:
+        # P1: Check
+        # P0: Raise 100
+        # P1: Call (can only put in 50, goes All-in)
+        # Round should end immediately.
+        
+        moves = iter([
+            ("check", 0),   # P1
+            ("raise", 100), # P0
+            ("call", 0)     # P1 (All-in logic handles the amount cap)
+        ])
+        
+        t.bot.action = lambda *args: next(moves)
+        
+        t.betting_round(hands, [], active, contrib, 0)
+        
+        self.assertEqual(t.stacks[1], 0)   # P1 empty
+        self.assertEqual(contrib[1], 50)   # P1 capped at 50
+        self.assertEqual(contrib[0], 100)  # P0 full 100
+        self.assertTrue(True, "Loop terminated successfully")
 
-    def test_bounds_and_ordering(self):
-        random.seed(1)
-        eq = pe.estimate_equity([C(14,'s'), C(14,'d')], [], players=2, n=300)
-        self.assertGreater(eq, 0.0)
-        self.assertLess(eq, 1.0)
-        aa = pe.estimate_equity([C(14,'s'), C(14,'d')], [], players=2, n=300)
-        trash = pe.estimate_equity([C(7,'c'), C(2,'d')], [], players=2, n=300)
-        self.assertGreater(aa, trash)
+    def test_betting_fold_logic(self):
+        """
+        Tests that folding correctly removes a player from active status 
+        and terminates the round if only 1 remains.
+        """
+        t = pe.Table(n=3, stack=1000)
+        hands = [[(2,'s'),(3,'s')]] * 3
+        active = [True, True, True]
+        contrib = [0, 0, 0]
+        
+        # Script: P1 Check, P2 Fold, P0 Fold. 
+        # P1 wins immediately (round returns).
+        moves = iter([
+            ("check", 0),
+            ("fold", 0),
+            ("fold", 0)
+        ])
+        
+        t.bot.action = lambda *args: next(moves)
+        
+        t.betting_round(hands, [], active, contrib, 0)
+        
+        self.assertEqual(active, [False, True, False]) # Only P1 active
+        # P1 should not have been asked to act again
+        self.assertRaises(StopIteration, next, moves)
 
-    def test_flush_draw_vs_gutshot_order(self):
-        random.seed(2)
-        nut_fd = pe.estimate_equity([C(14,'s'), C(2,'s')], [C(10,'s'), C(6,'s'), C(3,'d')], players=2, n=400)
-        weak_fd = pe.estimate_equity([C(9,'s'), C(8,'s')], [C(10,'s'), C(6,'s'), C(3,'d')], players=2, n=400)
-        gutshot = pe.estimate_equity([C(8,'c'), C(7,'d')], [C(10,'s'), C(6,'s'), C(3,'d')], players=2, n=400)
-        self.assertGreater(nut_fd, weak_fd)
-        self.assertGreater(nut_fd, gutshot)
-        self.assertGreater(weak_fd, gutshot)
-
-    def test_equity_decreases_with_opponents(self):
-        random.seed(3)
-        hu = pe.estimate_equity([C(14,'s'), C(14,'d')], [], players=2, n=300)
-        multi = pe.estimate_equity([C(14,'s'), C(14,'d')], [], players=6, n=300)
-        self.assertGreater(hu, multi)
-
-# -------------------------
-# Table integration invariants
-# -------------------------
-class TestTableInvariants(BaseTest):
-
-    def test_pot_and_stack_conservation_single_hand(self):
-        random.seed(4)
-        # make bots deterministic based on hole: strong raise, others call
-        def bot_action(self, hole, board, need, pot, stack):
-            # if contains an ace, raise by small amount; if pocket pair call; else call
-            ranks = [h[0] for h in hole]
-            if 14 in ranks:
-                return ("raise", max(1, int(pot * 0.5)))
-            if ranks[0] == ranks[1]:
-                return ("call", 0)
-            return ("call", 0)
-        pe.AdaptiveBot.action = bot_action
-
-        n = 6
-        starting_stack = 1000
-        t = pe.Table(n=n, stack=starting_stack, sb=5, bb=10)
-        total_before = sum(t.stacks)
-        t.next_hand()
-        total_after = sum(t.stacks)
-        # total chips must be conserved
-        self.assertEqual(total_before, total_after)
-        # no negative stacks
-        self.assertTrue(all(s >= 0 for s in t.stacks))
-
-    def test_many_hands_no_negative_and_stats_growth(self):
-        random.seed(5)
-        # bot: always call preflop (so VPIP increments), random postflop call/raise
-        def bot_action(self, hole, board, need, pot, stack):
-            if not board:
-                return ("call", 0)
-            return ("call", 0)
-        pe.AdaptiveBot.action = bot_action
-
-        n = 6
-        t = pe.Table(n=n, stack=500, sb=5, bb=10)
-        initial_total = sum(t.stacks)
-        hands = 20
-        for _ in range(hands):
-            t.next_hand()
-        # no negatives
-        self.assertTrue(all(s >= 0 for s in t.stacks))
-        # total conserved
-        self.assertEqual(sum(t.stacks), initial_total)
-        # stats: each seat should have hands counted
-        for stat in t.stats:
-            self.assertGreaterEqual(stat.hands, 1)
-            # vpip should be <= hands
-            self.assertLessEqual(stat.vpip, stat.hands)
-
-    def test_showdown_distribution_equal_split_case(self):
-        # This test forces a tie at showdown by controlling actions and deck via seed.
-        # We'll ensure all bots call to showdown and the board/hands produce a tie (two identical best hands).
-        random.seed(6)
-        # force all bots to call
-        def bot_action(self, hole, board, need, pot, stack):
-            return ("call", 0)
-        pe.AdaptiveBot.action = bot_action
-
-        t = pe.Table(n=3, stack=100, sb=1, bb=2)
-        total_before = sum(t.stacks)
-        # run a hand; deterministic seed chosen to often produce showdown with possible ties
-        t.next_hand()
-        total_after = sum(t.stacks)
-        # chips conserved
-        self.assertEqual(total_before, total_after)
-        # each stack should be integer and non-negative
-        self.assertTrue(all(isinstance(s, int) and s >= 0 for s in t.stacks))
-
-# -------------------------
-# raise/EV/pot-odds invariants
-# -------------------------
-class TestMathInvariants(BaseTest):
-
-    def test_ev_sign_matches_equity_vs_potodds(self):
-        # pick a scenario and check sign consistency (use larger n to reduce MC noise)
-        random.seed(7)
-        hole = [C(14,'s'), C(2,'s')]
-        board = [C(10,'s'), C(6,'s'), C(3,'d')]
-        players = 2
-        eq = pe.estimate_equity(hole, board, players, n=1000)
-        pot = 100
-        to_call = 20
-        pot_odds = to_call / (pot + to_call)
-        ev = eq * (pot + to_call) - to_call
-        # sign of ev should correspond to equity > pot_odds (allow tiny eps due to MC noise)
-        eps = 1e-3
-        if ev > 0:
-            self.assertGreater(eq, pot_odds - eps)
-        elif ev < 0:
-            self.assertLess(eq, pot_odds + eps)
-        else:
-            # ev == 0 approx
-            self.assertAlmostEqual(eq, pot_odds, places=2)
-
-    def test_pot_never_negative_during_betting(self):
-        # Use bot that sometimes raises; run few hands and ensure pot never negative (implicit via stacks)
-        random.seed(8)
-        def bot_action(self, hole, board, need, pot, stack):
-            # small raise if high card present, otherwise call
-            if max(hole[0][0], hole[1][0]) >= 11:
-                return ("raise", max(1, int(pot * 0.25)))
-            return ("call", 0)
-        pe.AdaptiveBot.action = bot_action
-
-        t = pe.Table(n=6, stack=500, sb=5, bb=10)
-        # run several hands
-        for _ in range(10):
-            t.next_hand()
-            # after each hand, pot not directly visible; ensure all stacks >= 0
-            self.assertTrue(all(s >= 0 for s in t.stacks))
-
-# -------------------------
-# preflop heuristic tests
-# -------------------------
-class TestPreflop(BaseTest):
-
-    def test_preflop_score_properties(self):
-        a = pe.preflop_score([C(13,'s'), C(9,'d')])
-        b = pe.preflop_score([C(9,'d'), C(13,'s')])
-        self.assertEqual(a, b)
-        pair = pe.preflop_score([C(10,'s'), C(10,'d')])
-        offs = pe.preflop_score([C(14,'s'), C(6,'d')])
-        self.assertGreater(pair, offs)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

@@ -1,16 +1,16 @@
-# poker_engine_fixed.py
 import random
 import itertools
 from collections import Counter
 
+# --- Configuration & Constants ---
 RANKS = list(range(2, 15))
 SUITS = "cdhs"
-
 HUMAN_ID = 0
-MODE = "learn"
-BET_SIZES = [0.33, 0.66, 1.0]
+MODE = "learn"  # options: learn, play, eval
+BET_SIZES = [0.5, 1.0] # Pot sized bets
 N_MC = 500
 
+# --- Card Utilities ---
 def format_card(card):
     r, s = card
     m = {11: "J", 12: "Q", 13: "K", 14: "A"}
@@ -23,182 +23,140 @@ def make_deck():
 def deal(deck, n):
     return [deck.pop() for _ in range(n)]
 
-def ranks(cards):
-    return [r for r, _ in cards]
-
+# --- C. Hand Evaluator (Pure, Deterministic, Total Ordering) ---
 def best_hand_7(cards):
+    """
+    Evaluates 7 cards and returns a comparable tuple (category_score, tie_breakers).
+    Lower index in tuple is more significant.
+    """
+    def ranks(c): return [r for r, _ in c]
+    
     def eval5(c):
-        rc = Counter(ranks(c))
+        r_list = ranks(c)
+        rc = Counter(r_list)
         sc = Counter(s for _, s in c)
-        uniq_desc = sorted(set(ranks(c)), reverse=True)
+        uniq_desc = sorted(set(r_list), reverse=True)
+        
         def find_straight_high(sorted_desc):
+            # Normal straight
             r = sorted_desc[:]
-            if 14 in r:
-                r.append(1)
+            # Wheel check (A-2-3-4-5)
+            if 14 in r: r.append(1)
             for i in range(len(r) - 4):
                 if r[i] - r[i + 4] == 4:
                     return r[i]
             return None
+
         flush_suit = next((s for s, cnt in sc.items() if cnt >= 5), None)
+        
+        # 8. Straight Flush
         if flush_suit:
             flush_ranks = sorted(set(r for r, s in c if s == flush_suit), reverse=True)
             sf_high = find_straight_high(flush_ranks)
-            if sf_high:
-                return (8, (sf_high,))
+            if sf_high: return (8, (sf_high,))
+
         straight_high = find_straight_high(uniq_desc)
         counts = sorted(rc.items(), key=lambda x: (x[1], x[0]), reverse=True)
+        
+        # 7. Four of a Kind
         if counts[0][1] == 4:
-            four = counts[0][0]
-            kicker = max(r for r in uniq_desc if r != four)
-            return (7, (four, kicker))
-        if counts[0][1] == 3 and any(cnt >= 2 for _, cnt in counts[1:]):
-            three = counts[0][0]
-            pair = next(r for r, cnt in counts[1:] if cnt >= 2)
-            return (6, (three, pair))
+            return (7, (counts[0][0], max(r for r in uniq_desc if r != counts[0][0])))
+            
+        # 6. Full House
+        if counts[0][1] == 3 and len(counts) > 1 and counts[1][1] >= 2:
+            return (6, (counts[0][0], counts[1][0]))
+        
+        # 5. Flush
         if flush_suit:
-            top5 = tuple(sorted([r for r, s in c if s == flush_suit], reverse=True)[:5])
-            return (5, top5)
+            # top 5 cards of the flush suit
+            return (5, tuple(sorted([r for r, s in c if s == flush_suit], reverse=True)[:5]))
+        
+        # 4. Straight
         if straight_high:
             return (4, (straight_high,))
+        
+        # 3. Trips
         if counts[0][1] == 3:
-            trips = counts[0][0]
-            kickers = tuple([r for r in uniq_desc if r != trips][:2])
-            return (3, (trips,) + kickers)
+            k = tuple([r for r in uniq_desc if r != counts[0][0]][:2])
+            return (3, (counts[0][0],) + k)
+        
+        # 2. Two Pair
         if len(counts) >= 2 and counts[0][1] == 2 and counts[1][1] == 2:
-            p1, p2 = counts[0][0], counts[1][0]
-            kicker = next(r for r in uniq_desc if r not in (p1, p2))
-            return (2, (p1, p2, kicker))
+            k = next((r for r in uniq_desc if r not in (counts[0][0], counts[1][0])), 0)
+            return (2, (counts[0][0], counts[1][0], k))
+        
+        # 1. Pair
         if counts[0][1] == 2:
-            pair = counts[0][0]
-            kickers = tuple([r for r in uniq_desc if r != pair][:3])
-            return (1, (pair,) + kickers)
+            k = tuple([r for r in uniq_desc if r != counts[0][0]][:3])
+            return (1, (counts[0][0],) + k)
+        
+        # 0. High Card
         return (0, tuple(uniq_desc[:5]))
+
     best = (-1, ())
     for c in itertools.combinations(cards, 5):
         v = eval5(c)
-        if v > best:
-            best = v
+        if v > best: best = v
     return best
 
-def estimate_equity(hole, board, players, n=N_MC):
-    wins = 0.0
-    known = set(hole + board)
-    remaining = [(r, s) for r in RANKS for s in SUITS if (r, s) not in known]
-    need_cards = 2 * (players - 1) + (5 - len(board))
-    for _ in range(n):
-        draw = random.sample(remaining, need_cards)
-        opps = [draw[i*2:(i+1)*2] for i in range(players - 1)]
-        full_board = board + draw[2*(players-1):]
-        hero = best_hand_7(hole + full_board)
-        best = hero
-        tie = 1
-        for o in opps:
-            v = best_hand_7(o + full_board)
-            if v > best:
-                best = v
-                tie = 0
-            elif v == best:
-                tie += 1
-        if best == hero:
-            wins += 1.0 / tie
-    return wins / n
-
-def get_hand_name(v):
-    d = {8: "Straight Flush",7: "Four of a Kind",6: "Full House",5: "Flush",4: "Straight",3: "Three of a Kind",2: "Two Pair",1: "One Pair",0: "High Card"}
-    return d.get(v[0], "Unknown")
-
-def pos_label(btn, seat, n):
-    rel = (seat - btn) % n
-    if rel == 0: return "BTN"
-    if rel == 1: return "SB"
-    if rel == 2: return "BB"
-    order = ["UTG", "UTG+1", "MP", "CO", "CO+1", "HJ"]
-    return order[(rel-3) % len(order)]
-
-def preflop_score(hole):
-    s = hole[0][0] + hole[1][0]
-    if hole[0][0] == hole[1][0]:
-        s += 15
-    return s
-
-def rule_action(hole, board, to_call, pot, stack):
-    if not board:
-        s = preflop_score(hole)
-        if s > 30: return "raise", int(pot * 0.66)
-        if s > 20: return "call", 0
-        return "fold", 0
-    cat = best_hand_7(hole + board)[0]
-    if cat >= 4: return "raise", int(pot * 0.66)
-    if cat >= 2: return "call", 0
-    return "fold", 0
-
-def explain_decision(hole, board, to_call, pot, stack, players):
-    print("\n--- Decision helper ---")
-    if not board:
-        s = preflop_score(hole)
-        print("Preflop", f"Hand: {format_card(hole[0])} {format_card(hole[1])}", f"Score:{s}")
-    else:
-        hv = best_hand_7(hole+board)
-        print("Postflop", f"Hand: {format_card(hole[0])} {format_card(hole[1])}")
-        print("Board:", " ".join(format_card(c) for c in board))
-        print("Best:", get_hand_name(hv), "Category", hv[0])
-        eq = estimate_equity(hole, board, players)
-        print(f"Equity ≈ {eq:.2%}")
-    print("---")
-
+# --- Stats & AI Stub ---
 class Stats:
     def __init__(self):
         self.hands = 0
         self.vpip = 0
         self.pfr = 0
-        self.aggr = 0
-        self.calls = 0
     def vpip_rate(self): return self.vpip / self.hands if self.hands else 0
-    def pfr_rate(self): return self.pfr / self.hands if self.hands else 0
-    def af(self): return self.aggr / self.calls if self.calls else 0.0
 
 class AdaptiveBot:
     def __init__(self, stats): self.stats = stats
-    def action(self, hole, board, need, pot, stack):
-        vpip = self.stats[HUMAN_ID].vpip_rate()
-        pfr = self.stats[HUMAN_ID].pfr_rate()
-        loose = vpip > 0.4
-        passive = pfr < 0.15
-        if not board:
-            s = preflop_score(hole)
-            if loose: s += 5
-            if s > 28: return "raise", int(pot * 0.7)
-            if s > 20: return "call", 0
-            return "fold", 0
-        cat = best_hand_7(hole + board)[0]
-        if cat >= 4: return "raise", int(pot * (1.0 if loose else 0.66))
-        if cat >= 2: return "call", 0
-        if passive and need == 0: return "raise", int(pot * 0.33)
+    def action(self, hole, board, need, pot, stack, valid_actions):
+        # Extremely simple baseline
+        if "check" in valid_actions and need == 0: return "check", 0
+        if "call" in valid_actions and need > 0: return "call", 0
         return "fold", 0
 
-def human_action(hole, board, to_call, pot, stack, players, btn, seat, n):
-    pl = pos_label(btn, seat, n)
-    print(f"\nYou are {pl} Seat {seat} Stack={stack}")
-    print("Your:", format_card(hole[0]), format_card(hole[1]))
-    if MODE == "learn": explain_decision(hole, board, to_call, pot, stack, players)
-    elif MODE in ("hint","eval"): print("Hint:", rule_action(hole, board, to_call, pot, stack)[0])
-    if MODE == "eval":
-        eq = estimate_equity(hole, board, players)
-        odds = to_call / (pot + to_call) if to_call else 0
-        print(f"Equity≈{eq:.2f} PotOdds≈{odds:.2f}")
-    while True:
-        a = input("Action [f/c/r]: ").strip().lower()
-        if a in ("f","c","r"): break
-        print("Invalid")
-    if a == "r":
-        print("Sizes:", BET_SIZES)
-        s = float(input("Size: ").strip())
-        if s not in BET_SIZES: raise ValueError(f"Size must be one of {BET_SIZES}")
-        amt = int(pot * s)
-        return "raise", max(1, amt)
-    if a == "c": return "call", 0
-    return "fold", 0
+# --- A. Side Pot Construction (Core Requirement) ---
+def build_side_pots(contrib, active):
+    """
+    Constructs main and side pots based on player contributions.
+    Returns a list of tuples: (pot_amount, list_of_eligible_player_indices)
+    
+    Algorithm:
+    1. Identify all unique positive contribution levels from *active* players.
+    2. Sort levels ascending.
+    3. Slice total contributions (including folded players) into these levels.
+    """
+    # Active players with chips in play define the "caps"
+    active_contribs = sorted(list(set(c for i, c in enumerate(contrib) if active[i] and c > 0)))
+    
+    pots = []
+    last_level = 0
+    
+    for level in active_contribs:
+        chunk_size = level - last_level
+        pot_amount = 0
+        eligible = []
+        
+        # Calculate who pays into this chunk and who is eligible
+        for i in range(len(contrib)):
+            # How much does player i contribute to this specific slice?
+            # They contribute max(0, min(total_contrib, level) - last_level)
+            payment = max(0, min(contrib[i], level) - last_level)
+            pot_amount += payment
+            
+            # If active and put in at least this level (implied by active logic), they are eligible
+            # We explicitly check strictly: active AND full contribution >= level
+            if active[i] and contrib[i] >= level:
+                eligible.append(i)
+        
+        if pot_amount > 0:
+            pots.append({'amount': pot_amount, 'eligible': eligible})
+        
+        last_level = level
+        
+    return pots
 
+# --- B. Betting State Machine ---
 class Table:
     def __init__(self, n=6, stack=1000, sb=5, bb=10):
         self.n = n
@@ -208,143 +166,256 @@ class Table:
         self.bb = bb
         self.stats = [Stats() for _ in range(n)]
         self.bot = AdaptiveBot(self.stats)
-    def show_table_state(self, hands, contrib, active, pot):
-        print("\n-- Table snapshot --")
-        for i in range(self.n):
-            p = pos_label(self.btn, i, self.n)
-            hand_str = "??" if active[i] and i != HUMAN_ID else " ".join(format_card(c) for c in hands[i])
-            print(f"Seat {i:>2} {p:>6} | Stack {self.stacks[i]:>5} | Contrib {contrib[i]:>4} | Active {active[i]} | Cards: {hand_str}")
-        print(f"Pot: {pot}")
+
+    def get_valid_actions(self, i, current_max, my_contrib, my_stack):
+        actions = ["fold"]
+        to_call = current_max - my_contrib
+        
+        if to_call == 0:
+            actions.append("check")
+            if my_stack > 0: actions.append("raise")
+        elif to_call >= my_stack:
+            actions.append("call") # effectively all-in
+        else:
+            actions.append("call")
+            if my_stack > to_call: actions.append("raise")
+            
+        return actions
+
+    def betting_round(self, hands, board, active, contrib, pot_start, is_preflop=False):
+        """
+        Executes a betting round using the provable termination conditions.
+        """
+        # State Initialization
+        current_max_bet = max(contrib)
+        last_raise_size = self.bb if is_preflop else 0
+        
+        # Who needs to act? Everyone active needs to check/call/fold unless all-in.
+        # We track "acted_since_last_raise" flags.
+        acted = [False] * self.n
+        
+        # Start pointer
+        if is_preflop:
+            # BB has acted implicitly (posted blind), but if raised, needs to act again.
+            # However, in standard loops, we start UTG.
+            start_i = (self.btn + 3) % self.n 
+            # Pre-set blinds as not having fully acted relative to a potential raise?
+            # Actually, standard machine: clear acted, loop starts.
+            # Blinds are handled by initial contribution state.
+            # Special case: BB is "live" if no raises.
+            # To simplify: reset all acted to False.
+            pass
+        else:
+            start_i = (self.btn + 1) % self.n
+
+        idx = start_i
+        
+        while True:
+            # TERMINATION CHECK:
+            # Round ends if:
+            # 1. Only 1 player active.
+            # OR
+            # 2. For ALL active players:
+            #    (Player is All-In) OR (Player has Acted AND Player Contribution == Max Bet)
+            
+            active_count = sum(1 for x in active if x)
+            if active_count <= 1:
+                return # End immediately
+            
+            can_terminate = True
+            for p in range(self.n):
+                if not active[p]: continue
+                if self.stacks[p] == 0: continue # All-in players are done
+                
+                # If player has stack, they must have acted AND matched the bet
+                if not acted[p] or contrib[p] != current_max_bet:
+                    can_terminate = False
+                    break
+            
+            if can_terminate:
+                return
+
+            # Skip inactive or all-in players
+            if not active[idx] or self.stacks[idx] == 0:
+                idx = (idx + 1) % self.n
+                continue
+
+            # Player Action Required
+            to_call = current_max_bet - contrib[idx]
+            valid_acts = self.get_valid_actions(idx, current_max_bet, contrib[idx], self.stacks[idx])
+            
+            # --- Input / Bot Logic ---
+            if idx == HUMAN_ID:
+                print(f"\nYour turn. Pot: {pot_start + sum(contrib)}. To Call: {to_call}. Stack: {self.stacks[idx]}")
+                print(f"Board: {' '.join(format_card(c) for c in board)}")
+                print(f"Hand: {format_card(hands[idx][0])} {format_card(hands[idx][1])}")
+                
+                while True:
+                    choice = input(f"Action {valid_acts}: ").strip().lower()
+                    if choice == "r": choice = "raise"
+                    if choice == "c": choice = "call"
+                    if choice == "f": choice = "fold"
+                    if choice == "k": choice = "check"
+                    if choice in valid_acts: break
+                
+                amt = 0
+                if choice == "raise":
+                    min_r = max(last_raise_size, self.bb)
+                    val = input(f"Raise amount (min {min_r}): ")
+                    try:
+                        amt = int(val)
+                    except:
+                        amt = min_r
+                    if amt < min_r: amt = min_r
+            else:
+                # Simple bot logic
+                choice, amt = self.bot.action(hands[idx], board, to_call, pot_start + sum(contrib), self.stacks[idx], valid_acts)
+
+            # --- State Update ---
+            if choice == "fold":
+                active[idx] = False
+                acted[idx] = True # Irrelevant now, but correct state
+            
+            elif choice == "check":
+                acted[idx] = True
+            
+            elif choice == "call":
+                amount = min(self.stacks[idx], to_call)
+                self.stacks[idx] -= amount
+                contrib[idx] += amount
+                acted[idx] = True
+                
+            elif choice == "raise":
+                # Raise logic: Call the current bet + Add raise amount
+                call_part = current_max_bet - contrib[idx]
+                total_needed = call_part + amt
+                
+                actual_pay = min(self.stacks[idx], total_needed)
+                self.stacks[idx] -= actual_pay
+                contrib[idx] += actual_pay
+                
+                new_raise_size = contrib[idx] - current_max_bet
+                
+                # If the raise was substantial (>= min raise), it re-opens action
+                # If all-in for less than min-raise, it usually does NOT re-open action for those who already acted (not implemented here for simplicity, assuming all raises reopen)
+                if new_raise_size > 0:
+                    current_max_bet = contrib[idx]
+                    last_raise_size = new_raise_size
+                    # Reset acted flags for everyone else who is active
+                    for i in range(self.n):
+                        if i != idx and active[i] and self.stacks[i] > 0:
+                            acted[i] = False
+                
+                acted[idx] = True
+
+            idx = (idx + 1) % self.n
+
     def next_hand(self):
+        # 1. Setup
         deck = make_deck()
         random.shuffle(deck)
-        hands = [deal(deck,2) for _ in range(self.n)]
+        hands = [deal(deck, 2) for _ in range(self.n)]
         board = []
-        active = [True]*self.n
-        contrib = [0]*self.n
+        active = [True] * self.n
+        
+        # SB/BB Posting
+        sb_pos = (self.btn + 1) % self.n
+        bb_pos = (self.btn + 2) % self.n
+        
+        # Contrib array tracks chips committed *in the current street*
+        # We merge into 'pot' at end of street.
+        contrib = [0] * self.n
         pot = 0
-        sb_i = (self.btn + 1) % self.n
-        bb_i = (self.btn + 2) % self.n
-        self.stacks[sb_i] -= self.sb
-        self.stacks[bb_i] -= self.bb
-        contrib[sb_i] = self.sb
-        contrib[bb_i] = self.bb
-        pot = self.sb + self.bb
-        to_call = self.bb
-        last_raise_by = self.bb
-        last_raiser = None
-        action_history = []
-        def betting(start, is_preflop=False):
-            nonlocal pot, to_call, last_raise_by, last_raiser
-            if sum(active) <= 1: return
-            max_contrib = max(contrib)
-            acted = [False] * self.n
-            i = start
-            while True:
-                if not active[i] or self.stacks[i] <= 0:
-                    acted[i] = True
-                else:
-                    need = max_contrib - contrib[i]
-                    if i == HUMAN_ID:
-                        act, amt = human_action(hands[i], board, need, pot, self.stacks[i], sum(active), self.btn, i, self.n)
-                    else:
-                        act, amt = self.bot.action(hands[i], board, need, pot, self.stacks[i])
-                    paid = 0
-                    if act == "fold":
-                        active[i] = False
-                        acted[i] = True
-                        action_history.append((i, pos_label(self.btn, i, self.n), "fold", 0, contrib[i]))
-                    elif act == "call":
-                        pay = min(need, self.stacks[i])
-                        if need > 0:
-                            pay = min(need, self.stacks[i])
-                            self.stacks[i] -= pay
-                            contrib[i] += pay
-                            pot += pay
-                        else:
-                            pay = 0
+        
+        # Post Blinds
+        sb_amt = min(self.stacks[sb_pos], self.sb)
+        self.stacks[sb_pos] -= sb_amt
+        contrib[sb_pos] += sb_amt
+        
+        bb_amt = min(self.stacks[bb_pos], self.bb)
+        self.stacks[bb_pos] -= bb_amt
+        contrib[bb_pos] += bb_amt
+        
+        # 2. Preflop
+        self.betting_round(hands, board, active, contrib, pot, is_preflop=True)
+        
+        # Merge Contribs
+        pot += sum(contrib)
+        
+        # Uncalled Bet Return Logic (Simplified)
+        # If one player bet way more than everyone else, the excess is technically returned.
+        # For this engine, we rely on Side Pot logic to handle distribution, 
+        # but pure poker rules return the excess immediately.
+        # We will keep it simple: Side pot 1 with 1 player is returned.
+        
+        contrib_history = list(contrib) # Store for records if needed
+        contrib = [0] * self.n # Reset for next street
 
-                        self.stats[i].calls += 1
-                        if is_preflop: self.stats[i].vpip += 1
-                        acted[i] = True
-                        action_history.append((i, pos_label(self.btn, i, self.n), "call", pay, contrib[i]))
-                    elif act == "raise":
-                        raise_by = amt
-                        min_raise_by = max(last_raise_by, self.bb) if is_preflop else max(last_raise_by, 1)
-                        if raise_by < min_raise_by: raise_by = min_raise_by
-                        need = max_contrib - contrib[i]
-                        target_pay = need + raise_by
-                        pay = min(target_pay, self.stacks[i])
-                        actual_raise_by = pay - need
-                        if pay > 0:
-                            self.stacks[i] -= pay
-                            contrib[i] += pay
-                            pot += pay
-                        max_contrib = contrib[i]
-                        to_call = max_contrib
-                        if actual_raise_by > 0: last_raise_by = actual_raise_by
-                        last_raiser = i
-                        acted = [False] * self.n
-                        acted[i] = True
-                        self.stats[i].aggr += 1
-                        if is_preflop:
-                            self.stats[i].vpip += 1
-                            self.stats[i].pfr += 1
-                        action_history.append((i, pos_label(self.btn, i, self.n), f"raise_by({actual_raise_by})", pay, contrib[i]))
-                i = (i + 1) % self.n
-                if sum(active) <= 1: break
-                if all((not active[j]) or acted[j] for j in range(self.n)) and all((not active[j]) or contrib[j] == max_contrib for j in range(self.n)):
-                    break
-
-        self.show_table_state(hands, contrib, active, pot)
-        betting((bb_i + 1) % self.n, is_preflop=True)
+        # 3. Flop
         if sum(active) > 1:
             board += deal(deck, 3)
-            betting((self.btn + 1) % self.n)
+            self.betting_round(hands, board, active, contrib, pot)
+            pot += sum(contrib)
+            for i, c in enumerate(contrib): contrib_history[i] += c
+            contrib = [0] * self.n
+
+        # 4. Turn
         if sum(active) > 1:
             board += deal(deck, 1)
-            betting((self.btn + 1) % self.n)
+            self.betting_round(hands, board, active, contrib, pot)
+            pot += sum(contrib)
+            for i, c in enumerate(contrib): contrib_history[i] += c
+            contrib = [0] * self.n
+
+        # 5. River
         if sum(active) > 1:
             board += deal(deck, 1)
-            betting((self.btn + 1) % self.n)
-        best = None
-        winners = []
-        showdown_info = []
-        for i in range(self.n):
-            if active[i]:
-                v = best_hand_7(hands[i] + board)
-                showdown_info.append((i, get_hand_name(v), v, hands[i]))
-                if best is None or v > best:
-                    best = v
-                    winners = [i]
-                elif v == best:
-                    winners.append(i)
-        pot_per = pot // len(winners)
-        rem = pot % len(winners)
-        for idx, w in enumerate(winners):
-            self.stacks[w] += pot_per + (1 if idx < rem else 0)
-        for i in range(self.n):
-            self.stats[i].hands += 1
+            self.betting_round(hands, board, active, contrib, pot)
+            pot += sum(contrib)
+            for i, c in enumerate(contrib): contrib_history[i] += c
+        
+        # 6. Showdown & Distribution
+        print("\n=== Showdown ===")
+        print(f"Board: {' '.join(format_card(c) for c in board)}")
+        
+        # Use total contributions across all streets for side pot calc
+        pots = build_side_pots(contrib_history, active)
+        
+        for p_idx, pot_obj in enumerate(pots):
+            amt = pot_obj['amount']
+            eligible = pot_obj['eligible']
+            
+            if not eligible: 
+                continue # Should not happen if logic is correct
+                
+            # Evaluate hands for eligible players
+            best_val = (-1,)
+            winners = []
+            
+            # Find winner(s) for this specific side pot
+            evals = []
+            for pid in eligible:
+                score = best_hand_7(hands[pid] + board)
+                evals.append((pid, score))
+                if score > best_val:
+                    best_val = score
+                    winners = [pid]
+                elif score == best_val:
+                    winners.append(pid)
+            
+            # Distribute
+            if winners:
+                share = amt // len(winners)
+                rem = amt % len(winners)
+                print(f"Pot {p_idx+1} ({amt}): Winners {winners} (Hand Class {best_val[0]})")
+                for w in winners:
+                    self.stacks[w] += share
+                # Odd chips to first position (simplified)
+                if rem: self.stacks[winners[0]] += rem
+        
         self.btn = (self.btn + 1) % self.n
-        print("\n=== HAND SUMMARY ===")
-        print("Button:", (self.btn-1) % self.n, "| SB:", sb_i, "BB:", bb_i)
-        print("Board:", " ".join(format_card(c) for c in board) if board else "[]")
-        print("\nAction history:")
-        for act in action_history:
-            seat, pos, a, paid, contrib_after = act
-            print(f" Seat {seat:>2} {pos:>6} | {a:>20} | paid {paid:>4} | contrib {contrib_after}")
-        print("\nShowdown (active players):")
-        for i, name, val, hs in showdown_info:
-            print(f" Seat {i:>2} {pos_label(self.btn-1, i, self.n):>6} | {format_card(hs[0])} {format_card(hs[1])} | {name} | val {val}")
-        print("\nWinners:", winners)
-        print("Stacks:", self.stacks)
-        print("\nStats (VPIP/PFR):")
-        for i in range(self.n):
-            print(f" Seat {i:>2} | VPIP {self.stats[i].vpip_rate():.2%} | PFR {self.stats[i].pfr_rate():.2%} | Hands {self.stats[i].hands}")
-        print("====================\n")
+        print(f"Stacks: {self.stacks}")
 
 if __name__ == "__main__":
     t = Table()
-    while True:
-        t.next_hand()
-        if input("Next hand? [enter/q]: ").strip().lower() == "q": break
+    t.next_hand()
